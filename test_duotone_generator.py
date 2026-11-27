@@ -618,6 +618,36 @@ class TestConvertToDuotone:
             dg.convert_to_duotone(source_image, count=1, seed=7)
         assert fifo.exists()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Named pipes require POSIX")
+    def test_manifest_special_file_is_rejected(self, source_image, tmp_path):
+        output_path = tmp_path / "source_duotone_variations"
+        output_path.mkdir()
+        os.mkfifo(output_path / "colors.csv")
+        keep = output_path / "keep.png"
+        keep.write_bytes(b"keep")
+
+        with pytest.raises(ValueError, match="special file"):
+            dg.convert_to_duotone(source_image, count=1)
+        assert keep.read_bytes() == b"keep"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or not hasattr(os, "O_NOFOLLOW"),
+        reason="Symlink no-follow requires POSIX O_NOFOLLOW",
+    )
+    def test_manifest_symlink_is_rejected(self, source_image, tmp_path):
+        output_path = tmp_path / "source_duotone_variations"
+        output_path.mkdir()
+        external = tmp_path / "external.csv"
+        external.write_text(
+            "variation,color_1_hex,color_2_hex\n0,#390C8C,#7D7247\n",
+            encoding="utf-8",
+        )
+        (output_path / "colors.csv").symlink_to(external)
+
+        with pytest.raises(ValueError, match="safely"):
+            dg.convert_to_duotone(source_image, count=1)
+        assert external.is_file()
+
     # -- input hardening ----------------------------------------------------
 
     def test_unsupported_extension_raises(self, source_image, tmp_path):

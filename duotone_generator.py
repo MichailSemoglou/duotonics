@@ -10,6 +10,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import struct
 import tempfile
 import warnings
@@ -564,13 +565,31 @@ def _duotone_key(image: np.ndarray, space: str) -> np.ndarray:
             + 0.0722 * linear[..., 2])
 
 
+def _open_regular_file(path: str) -> int:
+    """Open a regular file without blocking or following symlinks."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"Unable to open '{path}' safely: {exc}") from exc
+    try:
+        regular = stat.S_ISREG(os.fstat(descriptor).st_mode)
+    except OSError:
+        os.close(descriptor)
+        raise
+    if not regular:
+        os.close(descriptor)
+        raise ValueError(f"Unsupported special file in output folder: '{path}'.")
+    return descriptor
+
+
 def _read_previous_manifest(output_folder: str) -> set[str]:
     """Return filenames owned by the previous batch manifest."""
     manifest_path = os.path.join(output_folder, "colors.csv")
     if not os.path.exists(manifest_path):
         return set()
     owned = {"colors.csv", "metrics.csv"}
-    with open(manifest_path, newline="") as stream:
+    with os.fdopen(_open_regular_file(manifest_path), "r", newline="") as stream:
         reader = csv.DictReader(stream)
         if reader.fieldnames != ["variation", "color_1_hex", "color_2_hex"]:
             raise ValueError(f"Invalid batch manifest '{manifest_path}'.")
@@ -595,7 +614,7 @@ def _read_previous_manifest(output_folder: str) -> set[str]:
 def _file_digest(path: str) -> str:
     """Hash one file's contents to detect same-size, same-mtime edits."""
     digest = hashlib.sha256()
-    with open(path, "rb") as stream:
+    with os.fdopen(_open_regular_file(path), "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -620,12 +639,8 @@ def _unrelated_snapshot(
                 snapshot[relative] = (
                     "directory", os.lstat(path).st_mtime_ns, ""
                 )
-            elif os.path.isfile(path):
-                snapshot[relative] = ("file", 0, _file_digest(path))
             else:
-                raise ValueError(
-                    f"Unsupported special file in output folder: '{path}'."
-                )
+                snapshot[relative] = ("file", 0, _file_digest(path))
     return snapshot
 
 
