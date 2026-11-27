@@ -11,6 +11,7 @@ import re
 import shutil
 import struct
 import tempfile
+import warnings
 from collections.abc import Iterator
 
 import cv2
@@ -95,12 +96,9 @@ def hex_to_rgb(value: str) -> list[int]:
     Raises ValueError for anything else.
     """
     text = value.strip().removeprefix("#")
-    if len(text) != 6:
+    if re.fullmatch(r"[0-9A-Fa-f]{6}", text) is None:
         raise ValueError(f"Invalid hex color '{value}': expected '#RRGGBB'.")
-    try:
-        return [int(text[i:i + 2], 16) for i in (0, 2, 4)]
-    except ValueError:
-        raise ValueError(f"Invalid hex color '{value}': expected '#RRGGBB'.") from None
+    return [int(text[i:i + 2], 16) for i in (0, 2, 4)]
 
 
 def parse_color_pair(spec: str) -> tuple[list[int], list[int]]:
@@ -420,16 +418,12 @@ _SOF_MARKERS = frozenset({
     0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
     0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
 })
-_JPEG_HEADER_SCAN_LIMIT = 131072  # 128 KiB is enough to reach any SOF marker
-
-
 def _read_image_dimensions(image_path: str, ext: str) -> tuple[int, int]:
     """
     Return (width, height) by reading only the file header.
 
-    Reads 24 bytes for PNG, 26 bytes for BMP, and up to
-    _JPEG_HEADER_SCAN_LIMIT bytes for JPEG (stopping at the first SOF
-    marker). Raises ValueError on truncated or unrecognised headers.
+    Reads fixed-size PNG and BMP headers and scans JPEG marker headers
+    incrementally. Raises ValueError on truncated or unrecognised headers.
     """
     try:
         with open(image_path, "rb") as fh:
@@ -441,46 +435,64 @@ def _read_image_dimensions(image_path: str, ext: str) -> tuple[int, int]:
                 return width, height
 
             if ext in (".jpg", ".jpeg"):
-                chunk = fh.read(_JPEG_HEADER_SCAN_LIMIT)
-                if len(chunk) < 4 or chunk[:2] != b"\xff\xd8":
+                if fh.read(2) != b"\xff\xd8":
                     raise ValueError(f"'{image_path}' is not a valid JPEG file.")
-                pos = 2
-                while pos < len(chunk) - 8:
-                    if chunk[pos] != 0xFF:
+                while True:
+                    prefix = fh.read(1)
+                    if not prefix:
+                        raise ValueError(
+                            f"Truncated JPEG header in '{image_path}'."
+                        )
+                    if prefix != b"\xff":
                         raise ValueError(
                             f"Failed to read JPEG dimensions from '{image_path}'."
                         )
-                    pos += 1
-                    while pos < len(chunk) and chunk[pos] == 0xFF:
-                        pos += 1  # skip padding bytes
-                    if pos >= len(chunk):
-                        break
-                    marker = chunk[pos]
-                    pos += 1
+                    while prefix == b"\xff":
+                        prefix = fh.read(1)
+                        if not prefix:
+                            raise ValueError(
+                                f"Truncated JPEG header in '{image_path}'."
+                            )
+                    marker = prefix[0]
                     if marker in _SOF_MARKERS:
-                        if pos + 7 > len(chunk):
-                            break
-                        height, width = struct.unpack(">HH", chunk[pos + 3: pos + 7])
-                        return width, height
-                    if marker == 0xD9:  # EOI
-                        break
-                    if marker in range(0xD0, 0xDA) or marker == 0x01:
-                        continue  # standalone markers: no length field
-                    if pos + 2 > len(chunk):
-                        break
-                    seg_len = struct.unpack(">H", chunk[pos: pos + 2])[0]
-                    pos += seg_len
-                raise ValueError(
-                    f"Failed to read JPEG dimensions from '{image_path}'."
-                )
+                        header = fh.read(7)
+                        if len(header) < 7:
+                            raise ValueError(
+                                f"Truncated JPEG header in '{image_path}'."
+                            )
+                        return struct.unpack(">HH", header[3:7])
+                    if marker in (0xD9, 0xDA):
+                        raise ValueError(
+                            f"Failed to read JPEG dimensions from '{image_path}'."
+                        )
+                    if 0xD0 <= marker <= 0xD7 or marker == 0x01:
+                        continue
+                    length_bytes = fh.read(2)
+                    if len(length_bytes) < 2:
+                        raise ValueError(
+                            f"Truncated JPEG header in '{image_path}'."
+                        )
+                    segment_length = struct.unpack(">H", length_bytes)[0]
+                    if segment_length < 2:
+                        raise ValueError(
+                            f"Invalid JPEG segment length in '{image_path}'."
+                        )
+                    fh.seek(segment_length - 2, 1)
 
             if ext == ".bmp":
                 hdr = fh.read(26)
                 if len(hdr) < 26 or hdr[:2] != b"BM":
                     raise ValueError(f"'{image_path}' is not a valid BMP file.")
-                width = abs(struct.unpack("<i", hdr[18:22])[0])
-                height = abs(struct.unpack("<i", hdr[22:26])[0])
-                return width, height
+                dib_size = struct.unpack("<I", hdr[14:18])[0]
+                if dib_size == 12:
+                    return struct.unpack("<HH", hdr[18:22])
+                if dib_size >= 40:
+                    width = abs(struct.unpack("<i", hdr[18:22])[0])
+                    height = abs(struct.unpack("<i", hdr[22:26])[0])
+                    return width, height
+                raise ValueError(
+                    f"Unsupported DIB header size {dib_size} in '{image_path}'."
+                )
 
     except OSError as exc:
         raise ValueError(f"Failed to load image '{image_path}': {exc}") from exc
@@ -551,15 +563,85 @@ def _duotone_key(image: np.ndarray, space: str) -> np.ndarray:
             + 0.0722 * linear[..., 2])
 
 
+def _read_previous_manifest(output_folder: str) -> set[str]:
+    """Return filenames owned by the previous batch manifest."""
+    manifest_path = os.path.join(output_folder, "colors.csv")
+    if not os.path.exists(manifest_path):
+        return set()
+    owned = {"colors.csv", "metrics.csv"}
+    with open(manifest_path, newline="") as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames != ["variation", "color_1_hex", "color_2_hex"]:
+            raise ValueError(f"Invalid batch manifest '{manifest_path}'.")
+        for row in reader:
+            try:
+                index = int(row["variation"])
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid batch manifest '{manifest_path}'.") from None
+            if index < 0:
+                raise ValueError(f"Invalid batch manifest '{manifest_path}'.")
+            color1 = row["color_1_hex"].upper().removeprefix("#")
+            color2 = row["color_2_hex"].upper().removeprefix("#")
+            if any(
+                re.fullmatch(r"[0-9A-F]{6}", color) is None
+                for color in (color1, color2)
+            ):
+                raise ValueError(f"Invalid batch manifest '{manifest_path}'.")
+            owned.add(f"{index:03d}_{color1}_{color2}.png")
+    return owned
+
+
+def _unrelated_snapshot(
+    output_folder: str, excluded: set[str]
+) -> dict[str, tuple[int, int, str]]:
+    """Capture unrelated file metadata to detect live-folder changes."""
+    snapshot: dict[str, tuple[int, int, str]] = {}
+    if not os.path.isdir(output_folder):
+        return snapshot
+    for directory, directories, filenames in os.walk(output_folder):
+        for name in directories + filenames:
+            path = os.path.join(directory, name)
+            relative = os.path.relpath(path, output_folder)
+            if relative in excluded:
+                continue
+            stat = os.lstat(path)
+            target = os.readlink(path) if os.path.islink(path) else ""
+            snapshot[relative] = (stat.st_mtime_ns, stat.st_size, target)
+    return snapshot
+
+
+def _assert_no_unowned_conflicts(
+    output_folder: str, planned_files: set[str], previous_owned: set[str]
+) -> None:
+    """Reject planned output names that would overwrite unowned files."""
+    if not os.path.isdir(output_folder):
+        return
+    for name in planned_files - previous_owned:
+        path = os.path.join(output_folder, name)
+        if os.path.exists(path):
+            raise ValueError(
+                f"Planned output '{path}' conflicts with an unowned file."
+            )
+
+
 @contextlib.contextmanager
 def _batch_output_folder(
-    output_folder: str, base: str, stem: str
+    output_folder: str, base: str, stem: str, planned_files: set[str]
 ) -> Iterator[str]:
     """Stage a complete batch and publish it with a directory swap."""
     os.makedirs(base or ".", exist_ok=True)
     workdir = tempfile.mkdtemp(prefix=f".{stem}_duotone_", dir=base or ".")
     preserve_workdir = False
+    published = False
     try:
+        previous_owned = (
+            _read_previous_manifest(output_folder)
+            if os.path.isdir(output_folder)
+            else set()
+        )
+        _assert_no_unowned_conflicts(output_folder, planned_files, previous_owned)
+        excluded = previous_owned | planned_files
+        snapshot = _unrelated_snapshot(output_folder, excluded)
         next_folder = os.path.join(workdir, "next")
         if os.path.exists(output_folder):
             if not os.path.isdir(output_folder):
@@ -570,12 +652,7 @@ def _batch_output_folder(
             def ignore_previous_batch(directory: str, names: list[str]) -> set[str]:
                 if os.path.abspath(directory) != os.path.abspath(output_folder):
                     return set()
-                owned_png = re.compile(r"\d{3,}_[0-9A-F]{6}_[0-9A-F]{6}\.png")
-                return {
-                    name for name in names
-                    if name in {"colors.csv", "metrics.csv"}
-                    or owned_png.fullmatch(name)
-                }
+                return {name for name in names if name in previous_owned}
 
             shutil.copytree(
                 output_folder,
@@ -588,13 +665,21 @@ def _batch_output_folder(
 
         yield next_folder
 
+        _assert_no_unowned_conflicts(output_folder, planned_files, previous_owned)
+        if _unrelated_snapshot(output_folder, excluded) != snapshot:
+            raise RuntimeError(
+                "Output folder changed during generation; previous output was "
+                "left unchanged."
+            )
+
         previous_folder = os.path.join(workdir, "previous")
-        if os.path.exists(output_folder):
-            os.replace(output_folder, previous_folder)
         try:
+            if os.path.exists(output_folder):
+                os.replace(output_folder, previous_folder)
             os.replace(next_folder, output_folder)
-        except OSError:
-            if os.path.exists(previous_folder):
+            published = True
+        except (OSError, KeyboardInterrupt):
+            if os.path.exists(previous_folder) and not os.path.exists(output_folder):
                 try:
                     os.replace(previous_folder, output_folder)
                 except OSError as rollback_error:
@@ -606,7 +691,18 @@ def _batch_output_folder(
             raise
     finally:
         if not preserve_workdir:
-            shutil.rmtree(workdir)
+            if published:
+                try:
+                    shutil.rmtree(workdir)
+                except OSError as cleanup_error:
+                    warnings.warn(
+                        f"Batch published at '{output_folder}', but temporary files "
+                        f"remain at '{workdir}': {cleanup_error}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            else:
+                shutil.rmtree(workdir)
 
 
 def convert_to_duotone(
@@ -671,8 +767,9 @@ def convert_to_duotone(
         folder when output_dir is None) containing one PNG per variation,
         one 'colors.csv' file, and one 'metrics.csv' file. The batch is written
         to a temporary sibling directory before publication. Existing generated
-        files are replaced and unrelated files are preserved. If generation
-        fails, the previous output remains unchanged.
+        files listed in the previous batch manifest are replaced, and unrelated
+        files are preserved. If generation fails or unrelated files change during
+        generation, the previous output remains unchanged.
     """
     if space not in SPACES:
         raise ValueError(f"space must be one of {', '.join(SPACES)}, got '{space}'.")
@@ -700,7 +797,14 @@ def convert_to_duotone(
     base = output_dir if output_dir is not None else os.path.dirname(image_path)
     output_folder = os.path.join(base, f"{stem}_duotone_variations")
 
-    with _batch_output_folder(output_folder, base, stem) as staged_folder:
+    planned_files = {
+        f"{i:03d}_{rgb_to_hex(color1).lstrip('#')}_"
+        f"{rgb_to_hex(color2).lstrip('#')}.png"
+        for i, (color1, color2) in enumerate(pairs)
+    }
+    with _batch_output_folder(
+        output_folder, base, stem, planned_files
+    ) as staged_folder:
         color_records: list[list[int | str]] = []
         metric_records: list[list[int | float | str]] = []
         for i, (color1, color2) in enumerate(pairs):
@@ -799,7 +903,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--space",
         choices=SPACES,
-        default="srgb",
+        default=None,
         help="Color space for the blend: srgb is the legacy gamma-space "
              "blend; linear and oklab blend in linear sRGB and Oklab "
              "(Ottosson, 2020) over a relative-luminance key "
@@ -809,13 +913,17 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.image:
         flags_used = (
-            args.count is not None
+            args.output_dir is not None
+            or args.count is not None
             or args.seed is not None
             or args.colors
-            or args.space != "srgb"
+            or args.space is not None
         )
         if flags_used:
-            parser.error("--count, --seed, --colors and --space require an image path")
+            parser.error(
+                "--output-dir, --count, --seed, --colors and --space require "
+                "an image path"
+            )
         try:
             select_image()
         except ImportError:
@@ -823,6 +931,7 @@ def main(argv: list[str] | None = None) -> None:
                            "pass an image path to use CLI mode.\n")
         return
 
+    space = args.space or "srgb"
     colors = None
     if args.colors:
         if args.count is not None or args.seed is not None:
@@ -838,7 +947,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         output_folder, records = convert_to_duotone(
             args.image, output_dir=args.output_dir, count=count,
-            seed=args.seed, colors=colors, space=args.space,
+            seed=args.seed, colors=colors, space=space,
         )
     except Exception as e:  # noqa: BLE001
         parser.exit(1, f"Error: {e}\n")

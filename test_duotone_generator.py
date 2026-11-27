@@ -2,6 +2,7 @@
 Tests for duotone_generator.py
 
 Run with:
+    python -m pip install -e . -r requirements-dev.txt
     pytest test_duotone_generator.py
 """
 
@@ -9,6 +10,7 @@ import csv
 import importlib.metadata
 import os
 import random
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +22,9 @@ import pytest
 import duotone_generator as dg
 
 SCRIPT = Path(__file__).resolve().parent / "duotone_generator.py"
+DUOTONICS = Path(sys.executable).parent / (
+    "duotonics.exe" if os.name == "nt" else "duotonics"
+)
 
 
 def test_version_is_exposed():
@@ -275,6 +280,52 @@ class TestColorSpaces:
         )
 
 
+class TestImageHeaders:
+    def test_jpeg_with_large_app2_metadata(self, tmp_path):
+        path = tmp_path / "large_metadata.jpg"
+        image = np.zeros((16, 16, 3), dtype=np.uint8)
+        image[:] = [128, 64, 192]
+        assert cv2.imwrite(str(path), image)
+        encoded = path.read_bytes()
+        payload = b"\x01" * 60000
+        segments = [
+            b"\xff\xe2" + (len(payload) + 2).to_bytes(2, "big") + payload
+            for _ in range(3)
+        ]
+        path.write_bytes(encoded[:2] + b"".join(segments) + encoded[2:])
+
+        assert dg._read_image_dimensions(str(path), ".jpg") == (16, 16)
+        assert cv2.imread(str(path)).shape == (16, 16, 3)
+
+    def test_jpeg_rejects_invalid_segment_length(self, tmp_path):
+        path = tmp_path / "invalid.jpg"
+        path.write_bytes(b"\xff\xd8\xff\xe2\x00\x01")
+        with pytest.raises(ValueError, match="JPEG"):
+            dg._read_image_dimensions(str(path), ".jpg")
+
+    def test_os2_core_bmp_dimensions(self, tmp_path):
+        path = tmp_path / "core.bmp"
+        file_header = struct.pack("<2sIHHI", b"BM", 30, 0, 0, 26)
+        core_header = struct.pack("<IHHHH", 12, 1, 1, 1, 24)
+        path.write_bytes(file_header + core_header + b"\x00\x00\x00\x00")
+
+        assert dg._read_image_dimensions(str(path), ".bmp") == (1, 1)
+        assert cv2.imread(str(path)).shape == (1, 1, 3)
+
+    def test_bmp_rejects_unknown_dib_header(self, tmp_path):
+        path = tmp_path / "unknown.bmp"
+        file_header = struct.pack("<2sIHHI", b"BM", 30, 0, 0, 26)
+        core_header = struct.pack("<IHHHH", 13, 1, 1, 1, 24)
+        path.write_bytes(file_header + core_header + b"\x00\x00\x00\x00")
+        with pytest.raises(ValueError, match="DIB header"):
+            dg._read_image_dimensions(str(path), ".bmp")
+
+    @pytest.mark.parametrize("value", ["#+1AABB", "#-1AABB", "#１２３４５６"])
+    def test_non_ascii_hex_is_rejected(self, value):
+        with pytest.raises(ValueError, match="Invalid hex color"):
+            dg.hex_to_rgb(value)
+
+
 # ---------------------------------------------------------------------------
 # convert_to_duotone  (integration — writes real files to a temp dir)
 # ---------------------------------------------------------------------------
@@ -459,6 +510,98 @@ class TestConvertToDuotone:
         assert current == previous
         assert not list(tmp_path.glob(".source_duotone_*"))
 
+    def test_matching_unowned_png_is_preserved(self, source_image, tmp_path):
+        output_path = tmp_path / "source_duotone_variations"
+        output_path.mkdir()
+        handmade = output_path / "999_000000_FFFFFF.png"
+        handmade.write_bytes(b"handmade")
+
+        dg.convert_to_duotone(source_image, count=1, seed=42)
+
+        assert handmade.read_bytes() == b"handmade"
+
+    def test_unowned_output_name_conflict_stops_publication(
+        self, source_image, tmp_path
+    ):
+        output_path = tmp_path / "source_duotone_variations"
+        output_path.mkdir()
+        conflict = output_path / "000_390C8C_7D7247.png"
+        conflict.write_bytes(b"unowned")
+        with pytest.raises(ValueError, match="conflicts with an unowned file"):
+            dg.convert_to_duotone(source_image, count=1, seed=42)
+        assert conflict.read_bytes() == b"unowned"
+
+    def test_live_unrelated_edit_stops_publication(
+        self, source_image, tmp_path, monkeypatch
+    ):
+        folder, _ = dg.convert_to_duotone(source_image, count=1, seed=42)
+        output_path = tmp_path / folder
+        notes = output_path / "notes.txt"
+        notes.write_text("before", encoding="utf-8")
+        real_imwrite = dg.cv2.imwrite
+        edited = False
+
+        def edit_unrelated_file(path, image):
+            nonlocal edited
+            if not edited:
+                notes.write_text("during", encoding="utf-8")
+                edited = True
+            return real_imwrite(path, image)
+
+        monkeypatch.setattr(dg.cv2, "imwrite", edit_unrelated_file)
+        with pytest.raises(RuntimeError, match="changed during generation"):
+            dg.convert_to_duotone(source_image, count=1, seed=7)
+        assert notes.read_text(encoding="utf-8") == "during"
+
+    def test_keyboard_interrupt_restores_previous_batch(
+        self, source_image, tmp_path, monkeypatch
+    ):
+        folder, _ = dg.convert_to_duotone(source_image, count=1, seed=42)
+        output_path = tmp_path / folder
+        previous = {
+            path.name: path.read_bytes() for path in output_path.iterdir()
+        }
+        real_replace = dg.os.replace
+        replace_count = 0
+
+        def interrupt_publication(source, destination):
+            nonlocal replace_count
+            replace_count += 1
+            if replace_count == 2:
+                raise KeyboardInterrupt
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(dg.os, "replace", interrupt_publication)
+        with pytest.raises(KeyboardInterrupt):
+            dg.convert_to_duotone(source_image, count=1, seed=7)
+        current = {
+            path.name: path.read_bytes() for path in output_path.iterdir()
+        }
+        assert current == previous
+        assert not list(tmp_path.glob(".source_duotone_*"))
+
+    def test_cleanup_warning_after_successful_publication(
+        self, source_image, tmp_path, monkeypatch
+    ):
+        def fail_cleanup(path):
+            raise OSError("read-only directory")
+
+        monkeypatch.setattr(dg.shutil, "rmtree", fail_cleanup)
+        with pytest.warns(RuntimeWarning, match="temporary files remain"):
+            folder, records = dg.convert_to_duotone(source_image, count=1)
+        assert records
+        assert (tmp_path / folder).is_dir()
+
+    def test_invalid_manifest_preserves_output(self, source_image, tmp_path):
+        output_path = tmp_path / "source_duotone_variations"
+        output_path.mkdir()
+        (output_path / "colors.csv").write_text("not a manifest", encoding="utf-8")
+        keep = output_path / "keep.png"
+        keep.write_bytes(b"keep")
+        with pytest.raises(ValueError, match="manifest"):
+            dg.convert_to_duotone(source_image, count=1)
+        assert keep.read_bytes() == b"keep"
+
     # -- input hardening ----------------------------------------------------
 
     def test_unsupported_extension_raises(self, source_image, tmp_path):
@@ -517,6 +660,12 @@ class TestConvertToDuotone:
         _, records_a = dg.convert_to_duotone(source_image, output_dir=str(tmp_path / "a"), seed=42)
         _, records_b = dg.convert_to_duotone(source_image, output_dir=str(tmp_path / "b"), seed=42)
         assert records_a == records_b
+        for path_a in sorted((tmp_path / "a" / "source_duotone_variations").glob("*.png")):
+            path_b = tmp_path / "b" / "source_duotone_variations" / path_a.name
+            assert path_b.is_file()
+            image_a = cv2.imread(str(path_a))
+            image_b = cv2.imread(str(path_b))
+            assert np.array_equal(image_a, image_b)
 
     def test_seed_matches_known_sequence(self, source_image, tmp_path):
         # random.Random(42) deterministically yields this exact first pair.
@@ -720,6 +869,18 @@ class TestMain:
             dg.main(["--count", "5"])
         assert exc_info.value.code == 2
 
+    def test_output_dir_without_image_is_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(dg, "select_image", lambda: pytest.fail("GUI must not open"))
+        with pytest.raises(SystemExit) as exc_info:
+            dg.main(["--output-dir", str(tmp_path)])
+        assert exc_info.value.code == 2
+
+    def test_explicit_default_space_without_image_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(dg, "select_image", lambda: pytest.fail("GUI must not open"))
+        with pytest.raises(SystemExit) as exc_info:
+            dg.main(["--space", "srgb"])
+        assert exc_info.value.code == 2
+
     def test_cli_space_option_runs_oklab(self, source_image, tmp_path, capsys):
         dg.main([source_image, "--count", "1", "--space", "oklab"])
         folder = tmp_path / "source_duotone_variations"
@@ -755,7 +916,7 @@ class TestMain:
     ):
         result = subprocess.run(
             [
-                "duotonics", source_image, "--count", "1",
+                str(DUOTONICS), source_image, "--count", "1",
                 "--output-dir", str(tmp_path),
             ],
             capture_output=True, text=True, check=False,
