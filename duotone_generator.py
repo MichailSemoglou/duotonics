@@ -620,8 +620,12 @@ def _unrelated_snapshot(
                 snapshot[relative] = (
                     "directory", os.lstat(path).st_mtime_ns, ""
                 )
-            else:
+            elif os.path.isfile(path):
                 snapshot[relative] = ("file", 0, _file_digest(path))
+            else:
+                raise ValueError(
+                    f"Unsupported special file in output folder: '{path}'."
+                )
     return snapshot
 
 

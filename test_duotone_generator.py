@@ -608,6 +608,16 @@ class TestConvertToDuotone:
             dg.convert_to_duotone(source_image, count=1)
         assert keep.read_bytes() == b"keep"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Named pipes require POSIX")
+    def test_special_file_is_rejected_before_digest(self, source_image, tmp_path):
+        folder, _ = dg.convert_to_duotone(source_image, count=1, seed=42)
+        fifo = tmp_path / folder / "pipe"
+        os.mkfifo(fifo)
+
+        with pytest.raises(ValueError, match="special file"):
+            dg.convert_to_duotone(source_image, count=1, seed=7)
+        assert fifo.exists()
+
     # -- input hardening ----------------------------------------------------
 
     def test_unsupported_extension_raises(self, source_image, tmp_path):
