@@ -13,6 +13,7 @@ import random
 import struct
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 import cv2
@@ -22,7 +23,7 @@ import pytest
 import duotone_generator as dg
 
 SCRIPT = Path(__file__).resolve().parent / "duotone_generator.py"
-DUOTONICS = Path(sys.executable).parent / (
+DUOTONICS = Path(sysconfig.get_path("scripts")) / (
     "duotonics.exe" if os.name == "nt" else "duotonics"
 )
 
@@ -538,6 +539,7 @@ class TestConvertToDuotone:
         output_path = tmp_path / folder
         notes = output_path / "notes.txt"
         notes.write_text("before", encoding="utf-8")
+        original_times = notes.stat()
         real_imwrite = dg.cv2.imwrite
         edited = False
 
@@ -545,6 +547,10 @@ class TestConvertToDuotone:
             nonlocal edited
             if not edited:
                 notes.write_text("during", encoding="utf-8")
+                os.utime(
+                    notes,
+                    ns=(original_times.st_atime_ns, original_times.st_mtime_ns),
+                )
                 edited = True
             return real_imwrite(path, image)
 

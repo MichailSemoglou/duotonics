@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import hashlib
 import os
 import random
 import re
@@ -591,11 +592,20 @@ def _read_previous_manifest(output_folder: str) -> set[str]:
     return owned
 
 
+def _file_digest(path: str) -> str:
+    """Hash one file's contents to detect same-size, same-mtime edits."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _unrelated_snapshot(
     output_folder: str, excluded: set[str]
-) -> dict[str, tuple[int, int, str]]:
+) -> dict[str, tuple[str, int, str]]:
     """Capture unrelated file metadata to detect live-folder changes."""
-    snapshot: dict[str, tuple[int, int, str]] = {}
+    snapshot: dict[str, tuple[str, int, str]] = {}
     if not os.path.isdir(output_folder):
         return snapshot
     for directory, directories, filenames in os.walk(output_folder):
@@ -604,9 +614,14 @@ def _unrelated_snapshot(
             relative = os.path.relpath(path, output_folder)
             if relative in excluded:
                 continue
-            stat = os.lstat(path)
-            target = os.readlink(path) if os.path.islink(path) else ""
-            snapshot[relative] = (stat.st_mtime_ns, stat.st_size, target)
+            if os.path.islink(path):
+                snapshot[relative] = ("link", 0, os.readlink(path))
+            elif os.path.isdir(path):
+                snapshot[relative] = (
+                    "directory", os.lstat(path).st_mtime_ns, ""
+                )
+            else:
+                snapshot[relative] = ("file", 0, _file_digest(path))
     return snapshot
 
 
